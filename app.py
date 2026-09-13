@@ -2,314 +2,415 @@ import io
 import json
 import os
 import re
-import zipfile
-from typing import Any, Dict, Optional
-from xml.etree import ElementTree as ET
+from pathlib import Path
+from typing import Any
 
 import streamlit as st
-import requests
+from google import genai
+from google.genai import types
 from pypdf import PdfReader
+from docx import Document
+
+st.set_page_config(page_title="Resume ATS Analyzer", page_icon="ðŸ“„", layout="wide")
 
 MODEL_NAME = "gemini-2.5-flash"
-MAX_FILE_MB = 10
-MAX_RESUME_CHARS = 45000
+MAX_RESUME_CHARS = 50000
+
+WEIGHTS = {
+    "ats_format": 20,
+    "sections": 15,
+    "keywords": 20,
+    "experience_bullets": 20,
+    "skills": 10,
+    "contact": 5,
+    "education": 5,
+    "readability": 5,
+}
 
 
-def extract_pdf_text(file_bytes: bytes) -> str:
-    reader = PdfReader(io.BytesIO(file_bytes))
-    return "\n".join((page.extract_text() or "") for page in reader.pages).strip()
-
-
-def extract_docx_text(file_bytes: bytes) -> str:
-    """Extract DOCX text using only Python's standard library."""
-    with zipfile.ZipFile(io.BytesIO(file_bytes)) as archive:
-        xml_bytes = archive.read("word/document.xml")
-    root = ET.fromstring(xml_bytes)
-    ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
-    paragraphs = []
-    for paragraph in root.findall(".//w:p", ns):
-        text = "".join(
-            node.text or "" for node in paragraph.findall(".//w:t", ns)
-        ).strip()
-        if text:
-            paragraphs.append(text)
-    return "\n".join(paragraphs).strip()
-
-
-def extract_txt_text(file_bytes: bytes) -> str:
-    return file_bytes.decode("utf-8", errors="ignore").strip()
-
-
-def extract_resume_text(uploaded_file) -> str:
-    data = uploaded_file.getvalue()
-    ext = uploaded_file.name.lower().rsplit(".", 1)[-1]
-    if ext == "pdf":
-        return extract_pdf_text(data)
-    if ext == "docx":
-        return extract_docx_text(data)
-    if ext == "txt":
-        return extract_txt_text(data)
-    raise ValueError("Supported formats are PDF, DOCX, and TXT.")
-
-
-def get_api_key() -> Optional[str]:
+def get_api_key() -> str | None:
     try:
         key = st.secrets.get("GEMINI_API_KEY")
         if key:
             return str(key).strip()
     except Exception:
         pass
-    key = os.getenv("GEMINI_API_KEY")
-    return key.strip() if key else None
+    return os.getenv("GEMINI_API_KEY")
 
 
-def local_checks(resume: str, job_description: str) -> Dict[str, Any]:
-    lower = resume.lower()
-    words = re.findall(r"\b[a-zA-Z][a-zA-Z0-9+#./-]*\b", resume)
-    section_patterns = {
-        "Contact Information": r"(email|e-mail|phone|mobile|linkedin|github)",
-        "Summary / Profile": r"(professional summary|summary|profile|objective)",
-        "Experience": r"(work experience|professional experience|employment|experience)",
-        "Education": r"(education|academic)",
-        "Skills": r"(skills|technical skills|core competencies|technologies)",
-        "Projects": r"(projects|personal projects|academic projects)",
-    }
-    found = [name for name, pattern in section_patterns.items() if re.search(pattern, lower)]
-    bullets = sum(1 for line in resume.splitlines() if re.match(r"^\s*[-•*▪◦]\s+", line))
-    verbs = {
-        "achieved", "analyzed", "automated", "built", "created", "designed",
-        "developed", "delivered", "implemented", "improved", "increased",
-        "launched", "led", "managed", "optimized", "reduced", "resolved",
-        "streamlined", "tested", "trained", "coordinated",
-    }
-    action_count = sum(1 for w in re.findall(r"\b[a-zA-Z]+\b", lower) if w in verbs)
-    metric_count = len(re.findall(
-        r"(\b\d+(?:\.\d+)?\s*%|\$\s?\d+(?:[,.]\d+)*|\b\d+(?:\.\d+)?\s*(?:k|m|million|billion|years?|months?))",
-        lower, flags=re.I
-    ))
-    matched = []
-    total = 0
-    if job_description.strip():
-        jd_words = re.findall(r"\b[a-zA-Z][a-zA-Z0-9+#./-]{2,}\b", job_description.lower())
-        stop = {
-            "the", "and", "for", "with", "from", "that", "this", "are", "you",
-            "your", "our", "will", "have", "has", "had", "was", "were", "job",
-            "role", "work", "years", "year", "into", "about", "they", "their",
-            "who", "but", "not", "can", "all", "using", "use", "required",
-            "requirements", "candidate", "looking", "team", "including", "ability",
-        }
-        unique = []
-        seen = set()
-        for word in jd_words:
-            if word not in stop and word not in seen:
-                seen.add(word)
-                unique.append(word)
-        total = len(unique)
-        matched = [word for word in unique if word in lower]
-    return {
-        "word_count": len(words),
-        "found_sections": found,
-        "missing_sections": [x for x in section_patterns if x not in found],
-        "bullet_count": bullets,
-        "action_verb_count": action_count,
-        "metric_count": metric_count,
-        "keyword_match_count": len(matched),
-        "keyword_total": total,
-        "matched_keywords": matched[:40],
-    }
+def extract_pdf(file_bytes: bytes) -> str:
+    reader = PdfReader(io.BytesIO(file_bytes))
+    return "\n".join((page.extract_text() or "") for page in reader.pages).strip()
 
 
-def analyze_resume(resume: str, job_description: str, checks: Dict[str, Any]) -> Dict[str, Any]:
-    """Call Gemini directly over HTTPS, avoiding the google-genai SDK."""
-    api_key = get_api_key()
-    if not api_key:
-        raise RuntimeError(
-            "GEMINI_API_KEY is missing. Add it in Streamlit Cloud: "
-            "Manage app -> Settings -> Secrets."
+def extract_docx(file_bytes: bytes) -> str:
+    doc = Document(io.BytesIO(file_bytes))
+    parts = [p.text.strip() for p in doc.paragraphs if p.text.strip()]
+    for table in doc.tables:
+        for row in table.rows:
+            cells = [c.text.strip() for c in row.cells]
+            if any(cells):
+                parts.append(" | ".join(cells))
+    return "\n".join(parts).strip()
+
+
+def extract_text(uploaded_file) -> str:
+    data = uploaded_file.getvalue()
+    suffix = Path(uploaded_file.name).suffix.lower()
+
+    if suffix == ".pdf":
+        text = extract_pdf(data)
+    elif suffix == ".docx":
+        text = extract_docx(data)
+    elif suffix in {".txt", ".md"}:
+        text = data.decode("utf-8", errors="replace").strip()
+    else:
+        raise ValueError("Unsupported file type.")
+
+    if not text:
+        raise ValueError(
+            "No readable text was found. If this is a scanned/image-only PDF, "
+            "upload an OCR-enabled PDF or DOCX file."
         )
 
-    schema = {
-        "type": "OBJECT",
-        "properties": {
-            "ats_score": {"type": "INTEGER", "minimum": 0, "maximum": 100},
-            "score_breakdown": {
-                "type": "OBJECT",
-                "properties": {
-                    "format_structure": {"type": "INTEGER", "minimum": 0, "maximum": 100},
-                    "keyword_alignment": {"type": "INTEGER", "minimum": 0, "maximum": 100},
-                    "experience_impact": {"type": "INTEGER", "minimum": 0, "maximum": 100},
-                    "skills_completeness": {"type": "INTEGER", "minimum": 0, "maximum": 100},
-                },
-                "required": ["format_structure", "keyword_alignment", "experience_impact", "skills_completeness"],
-            },
-            "summary": {"type": "STRING"},
-            "strengths": {"type": "ARRAY", "items": {"type": "STRING"}},
-            "improvements": {"type": "ARRAY", "items": {"type": "STRING"}},
-            "missing_keywords": {"type": "ARRAY", "items": {"type": "STRING"}},
-            "rewrite_examples": {"type": "ARRAY", "items": {"type": "STRING"}},
-        },
-        "required": ["ats_score", "score_breakdown", "summary", "strengths", "improvements", "missing_keywords", "rewrite_examples"],
-    }
+    return text[:MAX_RESUME_CHARS]
 
-    prompt = f"""
-You are an expert ATS resume reviewer and career assistant.
 
-Analyze the resume and return an estimated ATS-readiness score from 0 to 100.
-This is not a score from a specific employer ATS and is not a hiring prediction.
-
-Score these dimensions: format/structure, keyword alignment, experience/impact,
-and skills/completeness. Never invent experience, education, skills, employers,
-dates, achievements, certifications, or numbers. Suggest relevant keywords from
-the job description. If no job description is supplied, say keyword alignment is limited.
-Give specific improvements and rewrite examples based only on information present.
-
-Deterministic checks:
-{json.dumps(checks, indent=2)}
-
-Job description:
-{job_description.strip() if job_description.strip() else "(Not provided)"}
-
-Resume:
---- BEGIN RESUME ---
-{resume[:MAX_RESUME_CHARS]}
---- END RESUME ---
-
-Return only valid JSON matching the supplied schema.
-"""
-
-    payload = {
-        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-        "generationConfig": {
-            "temperature": 0.2,
-            "responseMimeType": "application/json",
-            "responseSchema": schema,
-        },
-    }
-
-    url = (
-        "https://generativelanguage.googleapis.com/v1beta/models/"
-        "gemini-2.5-flash:generateContent"
+def build_prompt(resume: str, job_description: str) -> str:
+    jd = job_description.strip()
+    job_part = (
+        f"JOB DESCRIPTION:\n{jd[:30000]}"
+        if jd
+        else
+        "JOB DESCRIPTION:\nNot provided. Evaluate general ATS readiness."
     )
 
-    try:
-        response = requests.post(
-            url,
-            headers={
-                "x-goog-api-key": api_key,
-                "Content-Type": "application/json",
-            },
-            json=payload,
-            timeout=90,
-        )
-    except requests.RequestException as exc:
-        raise RuntimeError(f"Could not connect to Gemini API: {exc}") from exc
+    return f"""
+You are an expert ATS resume reviewer and technical recruiter.
 
-    if response.status_code != 200:
+Analyze the resume below for ATS-readiness and recruiter readability.
+
+Rules:
+- Base findings only on supplied resume/job description.
+- Never invent experience, employers, dates, degrees, certifications, skills,
+  metrics, achievements, or keywords.
+- Do not recommend keyword stuffing.
+- A missing keyword should only be recommended if the candidate genuinely has
+  that skill/experience.
+- Focus on likely ATS risks such as unusual section headings, columns/tables,
+  graphics/icons, headers/footers, unclear dates, and poor text structure.
+- If a job description is provided, distinguish keywords that are present from
+  keywords that are missing or weak.
+- Bullet rewrites must use only facts already present in the resume.
+- Return ONLY valid JSON.
+
+Score each category from 0 to 100:
+ats_format: parser-friendly structure and formatting
+sections: completeness and clarity of standard resume sections
+keywords: job-description alignment, or general role-relevant terminology
+experience_bullets: action verbs, specificity, outcomes, metrics, concision
+skills: clarity and relevance of skills
+contact: clear professional contact information
+education: clarity of education details
+readability: grammar, consistency, concision, scanability
+
+Return this exact JSON structure:
+{{
+  "summary": "string",
+  "category_scores": {{
+    "ats_format": 0,
+    "sections": 0,
+    "keywords": 0,
+    "experience_bullets": 0,
+    "skills": 0,
+    "contact": 0,
+    "education": 0,
+    "readability": 0
+  }},
+  "category_evidence": {{
+    "ats_format": "string",
+    "sections": "string",
+    "keywords": "string",
+    "experience_bullets": "string",
+    "skills": "string",
+    "contact": "string",
+    "education": "string",
+    "readability": "string"
+  }},
+  "strengths": ["string"],
+  "improvements": [
+    {{
+      "priority": "High|Medium|Low",
+      "issue": "string",
+      "recommendation": "string"
+    }}
+  ],
+  "keyword_analysis": {{
+    "present": ["string"],
+    "missing_or_weak": ["string"],
+    "notes": "string"
+  }},
+  "bullet_rewrites": [
+    {{
+      "original": "string",
+      "improved": "string",
+      "reason": "string"
+    }}
+  ],
+  "ats_checklist": ["string"]
+}}
+
+RESUME:
+{resume}
+
+{job_part}
+"""
+
+
+def normalize_result(result: dict[str, Any]) -> dict[str, Any]:
+    scores = result.get("category_scores", {})
+    normalized = {}
+
+    for key in WEIGHTS:
         try:
-            body = response.json()
-            message = body.get("error", {}).get("message", str(body))
-        except Exception:
-            message = response.text[:1000]
-        raise RuntimeError(f"Gemini API error ({response.status_code}): {message}")
+            value = int(round(float(scores.get(key, 0))))
+        except (TypeError, ValueError):
+            value = 0
+        normalized[key] = max(0, min(100, value))
 
-    try:
-        body = response.json()
-        text = body["candidates"][0]["content"]["parts"][0]["text"]
-        result = json.loads(text)
-    except (KeyError, IndexError, TypeError, json.JSONDecodeError) as exc:
-        raise RuntimeError("Gemini returned an unexpected or invalid JSON response.") from exc
+    result["category_scores"] = normalized
+    result["ats_score"] = round(
+        sum(normalized[k] * WEIGHTS[k] for k in WEIGHTS) / 100
+    )
 
-    result["ats_score"] = max(0, min(100, int(result.get("ats_score", 0))))
+    for key in ("strengths", "improvements", "bullet_rewrites", "ats_checklist"):
+        if not isinstance(result.get(key), list):
+            result[key] = []
+
+    if not isinstance(result.get("category_evidence"), dict):
+        result["category_evidence"] = {}
+
+    if not isinstance(result.get("keyword_analysis"), dict):
+        result["keyword_analysis"] = {
+            "present": [],
+            "missing_or_weak": [],
+            "notes": "",
+        }
+
     return result
 
 
-st.set_page_config(page_title="AI Resume Assistant", page_icon="📄", layout="wide")
-st.title("📄 AI Resume Assistant")
-st.write("Upload a resume, optionally paste a job description, and get an estimated ATS score and practical improvements.")
+def analyze_resume(resume: str, job_description: str) -> dict[str, Any]:
+    api_key = get_api_key()
+    if not api_key:
+        raise RuntimeError(
+            "GEMINI_API_KEY is missing. Add it to Streamlit Secrets or your "
+            "local environment."
+        )
+
+    client = genai.Client(api_key=api_key)
+
+    response = client.models.generate_content(
+        model=MODEL_NAME,
+        contents=build_prompt(resume, job_description),
+        config=types.GenerateContentConfig(
+            temperature=0.2,
+            response_mime_type="application/json",
+        ),
+    )
+
+    text = (response.text or "").strip()
+    text = re.sub(r"^```json\s*", "", text, flags=re.I)
+    text = re.sub(r"\s*```$", "", text)
+
+    if not text:
+        raise RuntimeError("Gemini returned an empty response.")
+
+    try:
+        result = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            "Gemini returned invalid JSON. Please try the analysis again."
+        ) from exc
+
+    if not isinstance(result, dict):
+        raise RuntimeError("Unexpected response format from Gemini.")
+
+    return normalize_result(result)
+
+
+def render_results(result: dict[str, Any]) -> None:
+    score = result["ats_score"]
+
+    st.divider()
+    st.subheader("ðŸŽ¯ ATS Readiness Score")
+    st.metric("Estimated ATS Score", f"{score}/100")
+    st.progress(score / 100)
+
+    if score >= 85:
+        st.success("Excellent ATS readiness.")
+    elif score >= 70:
+        st.info("Good ATS readiness, with some improvements recommended.")
+    elif score >= 55:
+        st.warning("The resume needs several improvements.")
+    else:
+        st.error("The resume has important ATS-readiness issues.")
+
+    st.caption(
+        "This is an AI-based ATS-readiness estimate, not a score from a specific "
+        "employer's ATS. Different ATS platforms and job descriptions can produce "
+        "different results."
+    )
+
+    st.subheader("ðŸ“Š Score Breakdown")
+    keys = list(WEIGHTS.keys())
+    for start in range(0, len(keys), 4):
+        cols = st.columns(4)
+        for col, key in zip(cols, keys[start:start + 4]):
+            with col:
+                st.metric(
+                    key.replace("_", " ").title(),
+                    f"{result['category_scores'][key]}/100",
+                )
+
+    with st.expander("Why did I get these scores?"):
+        evidence = result.get("category_evidence", {})
+        for key in WEIGHTS:
+            st.markdown(
+                f"**{key.replace('_', ' ').title()} â€” "
+                f"{result['category_scores'][key]}/100**"
+            )
+            st.write(evidence.get(key, "No explanation provided."))
+
+    st.subheader("ðŸ“ Overall Assessment")
+    st.write(result.get("summary", ""))
+
+    left, right = st.columns(2)
+
+    with left:
+        st.markdown("### âœ… Strengths")
+        for strength in result.get("strengths", []):
+            st.success(strength)
+
+    with right:
+        st.markdown("### ðŸ”§ Priority Improvements")
+        for item in result.get("improvements", []):
+            if isinstance(item, dict):
+                st.markdown(
+                    f"**{item.get('priority', 'Medium')}: "
+                    f"{item.get('issue', '')}**"
+                )
+                st.write(item.get("recommendation", ""))
+            else:
+                st.write(item)
+
+    st.subheader("ðŸ”‘ Keyword Analysis")
+    keywords = result.get("keyword_analysis", {})
+    c1, c2 = st.columns(2)
+
+    with c1:
+        st.markdown("**Present / clearly evidenced**")
+        present = keywords.get("present", [])
+        st.write(", ".join(present) if present else "None identified.")
+
+    with c2:
+        st.markdown("**Missing or weak**")
+        missing = keywords.get("missing_or_weak", [])
+        st.write(", ".join(missing) if missing else "None identified.")
+
+    if keywords.get("notes"):
+        st.caption(keywords["notes"])
+
+    st.subheader("âœï¸ Bullet Point Improvements")
+    rewrites = result.get("bullet_rewrites", [])
+
+    if not rewrites:
+        st.write("No bullet rewrites were suggested.")
+    else:
+        for i, item in enumerate(rewrites, 1):
+            if not isinstance(item, dict):
+                continue
+            with st.expander(f"Rewrite {i}"):
+                st.markdown("**Original**")
+                st.write(item.get("original", ""))
+                st.markdown("**Improved**")
+                st.write(item.get("improved", ""))
+                st.caption(item.get("reason", ""))
+
+    st.subheader("â˜‘ï¸ ATS Checklist")
+    for item in result.get("ats_checklist", []):
+        st.write(f"â˜ {item}")
+
+
+st.title("ðŸ“„ Resume ATS Analyzer")
+st.write(
+    "Upload your resume and optionally add a job description to get an "
+    "AI-powered ATS-readiness score and actionable improvements."
+)
 
 with st.sidebar:
     st.header("How it works")
-    st.markdown("1. Upload resume\n2. Paste job description\n3. Click Analyze Resume\n4. Review ATS score and recommendations")
-    st.caption(f"AI model: {MODEL_NAME}")
-    st.caption("Gemini is called through HTTPS; no Google GenAI SDK is required.")
+    st.markdown(
+        """
+**1. Upload resume**
 
-uploaded_file = st.file_uploader("Upload Resume", type=["pdf", "docx", "txt"])
-job_description = st.text_area("Job Description (recommended)", height=220, placeholder="Paste the job description here for better keyword matching.")
+PDF, DOCX, TXT or MD.
 
-if uploaded_file:
-    if uploaded_file.size / (1024 * 1024) > MAX_FILE_MB:
-        st.error(f"File is too large. Maximum size is {MAX_FILE_MB} MB.")
-        st.stop()
-    if st.button("🔍 Analyze Resume", type="primary", use_container_width=True):
-        try:
-            with st.spinner("Extracting resume text..."):
-                resume_text = extract_resume_text(uploaded_file)
-            if len(resume_text.strip()) < 100:
-                st.error("Not enough text could be extracted. Use a text-based PDF or DOCX.")
-                st.stop()
-            resume_text = resume_text[:MAX_RESUME_CHARS]
-            checks = local_checks(resume_text, job_description)
-            with st.spinner("Gemini is reviewing your resume..."):
-                analysis = analyze_resume(resume_text, job_description, checks)
-            st.session_state["analysis"] = analysis
-            st.session_state["checks"] = checks
-        except Exception as exc:
-            st.error("The resume could not be analyzed.")
-            st.code(str(exc))
+**2. Add job description**
 
-if "analysis" in st.session_state:
-    analysis = st.session_state["analysis"]
-    checks = st.session_state["checks"]
+Optional, but recommended for keyword matching.
+
+**3. Analyze**
+
+Gemini reviews the resume.
+
+**4. Improve**
+
+Get a score, weaknesses, keywords, and bullet rewrites.
+"""
+    )
     st.divider()
-    score = analysis["ats_score"]
-    status = "Excellent ATS readiness" if score >= 85 else "Good ATS readiness" if score >= 70 else "Needs improvement" if score >= 50 else "Major improvements recommended"
-    c1, c2 = st.columns([1, 2])
-    with c1:
-        st.metric("Estimated ATS Score", f"{score}/100")
-        st.progress(score / 100)
-        st.caption(status)
-    with c2:
-        st.subheader("Resume checks")
-        x1, x2, x3, x4 = st.columns(4)
-        x1.metric("Words", checks["word_count"])
-        x2.metric("Sections", len(checks["found_sections"]))
-        x3.metric("Bullets", checks["bullet_count"])
-        x4.metric("Metrics", checks["metric_count"])
+    st.caption(f"AI model: {MODEL_NAME}")
+    st.caption("No resume is permanently stored by this app.")
 
-    st.subheader("📊 Score Breakdown")
-    b = analysis["score_breakdown"]
-    x1, x2, x3, x4 = st.columns(4)
-    x1.metric("Format & Structure", f"{b['format_structure']}/100")
-    x2.metric("Keyword Alignment", f"{b['keyword_alignment']}/100")
-    x3.metric("Experience & Impact", f"{b['experience_impact']}/100")
-    x4.metric("Skills & Completeness", f"{b['skills_completeness']}/100")
+resume_file = st.file_uploader(
+    "ðŸ“Ž Upload your resume",
+    type=["pdf", "docx", "txt", "md"],
+)
 
-    st.subheader("🧠 Overall Assessment")
-    st.write(analysis["summary"])
-    left, right = st.columns(2)
-    with left:
-        st.subheader("✅ Strengths")
-        for item in analysis["strengths"]:
-            st.markdown(f"- {item}")
-    with right:
-        st.subheader("🚀 Improvements")
-        for item in analysis["improvements"]:
-            st.markdown(f"- {item}")
+job_description = st.text_area(
+    "ðŸ’¼ Job Description (Optional)",
+    height=220,
+    placeholder="Paste the job description here for job-specific ATS analysis...",
+)
 
-    st.subheader("🔑 Missing / Recommended Keywords")
-    if analysis["missing_keywords"]:
-        for keyword in analysis["missing_keywords"]:
-            st.markdown(f"- `{keyword}`")
-    else:
-        st.success("No major missing keywords were identified.")
+analyze = st.button(
+    "ðŸš€ Analyze Resume",
+    type="primary",
+    disabled=resume_file is None,
+    use_container_width=True,
+)
 
-    st.subheader("✍️ Rewrite Examples")
-    for example in analysis["rewrite_examples"]:
-        st.markdown(f"- {example}")
+if analyze and resume_file:
+    try:
+        with st.spinner("Extracting resume text..."):
+            resume_text = extract_text(resume_file)
 
-    if checks["missing_sections"]:
-        st.subheader("📌 Sections That May Be Missing")
-        for section in checks["missing_sections"]:
-            st.markdown(f"- {section}")
+        if len(resume_text) < 100:
+            st.warning(
+                "Only a small amount of text was extracted. "
+                "Make sure your resume is readable and not image-only."
+            )
 
-    st.info("ATS scores vary by employer, ATS vendor, job description, and resume format. Treat this score as an optimization guide, not a hiring prediction.")
+        with st.spinner("Gemini is analyzing your resume..."):
+            result = analyze_resume(resume_text, job_description)
+
+        st.session_state["result"] = result
+        st.session_state["filename"] = resume_file.name
+
+    except Exception as exc:
+        st.error(str(exc))
+
+if "result" in st.session_state:
+    st.caption(f"Analyzed: {st.session_state.get('filename', 'resume')}")
+    render_results(st.session_state["result"])
